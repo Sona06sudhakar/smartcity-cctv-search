@@ -1,0 +1,16 @@
+fastapi>=0.111.0
+uvicorn>=0.30.1
+python-multipart>=0.0.9
+ultralytics>=8.2.0
+transformers>=4.38.0
+torch
+torchvision
+faiss-cpu
+sqlalchemy
+reportlab
+deep-translator
+python-dotenv
+cryptography
+pydantic>=2.0
+pyjwt
+passlib[bcrypt]

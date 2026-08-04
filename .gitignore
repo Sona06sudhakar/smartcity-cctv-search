@@ -1,0 +1,42 @@
+# Python Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python caches
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Deep Learning weights (YOLO models, etc.)
+*.pt
+*.pth
+yolov8*.pt
+backend/yolov8*.pt
+
+# Database and FAISS Index files
+*.db
+*.sqlite3
+*.index
+backend/db.sqlite3
+backend/app/faiss_index.index
+
+# Frontend build outputs and packages
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+
+# Uploaded videos, generated crops, and forensic reports
+backend/static/
+backend/videos/
+extracted_crops/
+backend/extracted_crops/
+*.mp4
+
+# OS and IDE configuration files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
