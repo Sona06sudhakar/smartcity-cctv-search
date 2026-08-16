@@ -27,6 +27,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 120
 # AI Configuration
 DEVICE = "cuda"  # Will dynamically check torch.cuda.is_available() at model load
 YOLO_MODEL_NAME = "yolov8n.pt"  # Lightweight for low latency, or yolov8m.pt if available
+YOLO_MODEL_PATH = (Path(__file__).resolve().parent.parent.parent / YOLO_MODEL_NAME)
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 
 # CLIP Attribute Thresholds

@@ -13,9 +13,10 @@ from app.config import (
     CROPS_DIR,
     VIDEOS_DIR,
     YOLO_MODEL_NAME,
+    YOLO_MODEL_PATH,
     REID_SIMILARITY_THRESHOLD
 )
-from app.database import Video, Detection, SessionLocal, ChainOfCustody
+from app.database import Video, Detection, TrackPoint, SessionLocal, ChainOfCustody
 from app.search_engine import get_search_engine
 from app.attributes import extract_attributes
 from ultralytics import YOLO
@@ -27,8 +28,9 @@ class VideoPipeline:
 
     def _load_yolo(self):
         if self.model is None:
-            print(f"[Pipeline] Loading YOLO model {YOLO_MODEL_NAME}...")
-            self.model = YOLO(YOLO_MODEL_NAME)
+            model_path = str(YOLO_MODEL_PATH)
+            print(f"[Pipeline] Loading YOLO model from {model_path}...")
+            self.model = YOLO(model_path)
         return self.model
 
     def compute_sha256(self, filepath: str) -> str:
@@ -83,6 +85,9 @@ class VideoPipeline:
             # We'll save a high-quality crop for each tracked object
             # track_best_crops: {mapped_track_id: {"score": float, "box": Tuple, "frame": ndarray, "timestamp": str, "frame_num": int}}
             track_best_crops: Dict[int, Dict] = {}
+
+            # track_path_points: store a sequence of bounding boxes for each mapped track across processed frames
+            track_path_points: Dict[int, List[Dict]] = {}
 
             frame_num = 0
             start_time = datetime.utcnow()
@@ -174,13 +179,25 @@ class VideoPipeline:
                     else:
                         mapped_id = track_id_mapping[raw_track_id]
 
-                    # 2. Track best crop for extraction (preferring high confidence / large area)
                     x1, y1, x2, y2 = map(int, box)
                     box_width = x2 - x1
                     box_height = y2 - y1
                     area = box_width * box_height
                     
-                    if area > 100:  # Avoid tiny detections
+                    if area > 100:
+                        # Record the track point for this mapped track
+                        track_path_points.setdefault(mapped_id, []).append({
+                            "frame_number": frame_num,
+                            "timestamp": timestamp_str,
+                            "timestamp_sec": current_timestamp_sec,
+                            "x1": x1,
+                            "y1": y1,
+                            "x2": x2,
+                            "y2": y2,
+                            "class_name": class_name,
+                            "confidence": float(conf)
+                        })
+
                         if mapped_id not in track_best_crops or conf > track_best_crops[mapped_id]["score"]:
                             track_best_crops[mapped_id] = {
                                 "score": float(conf),
@@ -216,12 +233,13 @@ class VideoPipeline:
 
             # 3. Post-process the best crop for each mapped track and ingest it
             print(f"[Pipeline] Processing crops & extracting attributes for {len(track_best_crops)} unique tracks...")
-            
+
+            detections = []
             for mapped_id, crop_data in track_best_crops.items():
                 x1, y1, x2, y2 = crop_data["box"]
                 best_frame = crop_data["frame"]
                 class_name = crop_data["class_name"]
-                
+
                 cropped_img = best_frame[y1:y2, x1:x2]
                 if cropped_img.size == 0:
                     continue
@@ -230,23 +248,19 @@ class VideoPipeline:
                 crop_filename = f"vid_{video_id}_cam_{camera_id}_track_{mapped_id}.jpg"
                 crop_path = CROPS_DIR / crop_filename
                 cv2.imwrite(str(crop_path), cropped_img)
-                
+
                 # Get SHA256 of crop for Chain of Custody
                 crop_hash = self.compute_sha256(str(crop_path))
-                
+
                 # Load PIL image for CLIP processing
                 pil_crop = Image.fromarray(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
-                
+
                 # Generate embedding
                 embedding = search_engine.get_image_embedding(pil_crop)
-                
+
                 # Extract attributes via CLIP
                 attributes = extract_attributes(str(crop_path), class_name, search_engine)
-                
-                # Reserve a FAISS ID
-                # We can use the current length of the database detections or a timestamp
-                # Let's generate a unique faiss_id (integer)
-                # To guarantee uniqueness, we insert into SQLite first, get the record ID, and use it as faiss_id!
+
                 detection = Detection(
                     video_id=video_id,
                     camera_id=camera_id,
@@ -266,9 +280,9 @@ class VideoPipeline:
                 )
                 db.add(detection)
                 db.flush()  # Gets the auto-increment ID
-                
-                # Update with the correct faiss_id which is equal to database detection ID
+
                 detection.faiss_id = detection.id
+                detections.append(detection)
                 db.commit()
 
                 # Add to FAISS Vector Database
@@ -286,6 +300,28 @@ class VideoPipeline:
                     db.add(coc)
                     db.commit()
 
+            # Persist the track points for each mapped detection so playback and timelines can follow the same object
+            track_point_rows = []
+            for detection in detections:
+                points = track_path_points.get(detection.track_id, [])
+                for point in points:
+                    track_point_rows.append(TrackPoint(
+                        detection_id=detection.id,
+                        video_id=video_id,
+                        track_id=detection.track_id,
+                        frame_number=point["frame_number"],
+                        timestamp=point["timestamp"],
+                        timestamp_sec=point["timestamp_sec"],
+                        x1=point["x1"],
+                        y1=point["y1"],
+                        x2=point["x2"],
+                        y2=point["y2"],
+                        class_name=point["class_name"],
+                        confidence=point["confidence"]
+                    ))
+            if track_point_rows:
+                db.add_all(track_point_rows)
+                db.commit()
 
             # Mark video processing completed
             video.status = "completed"

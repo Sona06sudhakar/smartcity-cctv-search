@@ -1,8 +1,9 @@
 import json
 import time
+import re
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel
 from PIL import Image
 import io
@@ -13,6 +14,67 @@ from app.database import Detection, AuditLog, Video
 from app.search_engine import get_search_engine
 
 router = APIRouter(prefix="/api/search", tags=["Search Engine"])
+
+# Color and attribute mappings for query parsing
+COLORS = ["black", "white", "red", "blue", "yellow", "green", "grey", "gray", "orange", "pink", "purple", "brown", "silver"]
+VEHICLE_TYPES = ["hatchback", "sedan", "suv", "truck", "van", "bus", "motorcycle", "bicycle"]
+CLOTHING_ITEMS = ["shirt", "t-shirt", "jacket", "coat", "sweater", "hoodie", "top", "upper", "pants", "jeans", "trousers", "lower", "dress", "skirt"]
+ACCESSORIES = ["cap", "hat", "bag", "backpack", "purse", "helmet"]
+
+def parse_query_attributes(query: str) -> Dict[str, str]:
+    """
+    Extract structured attributes from natural language query.
+    Returns dict with keys: upper_color, lower_color, vehicle_type, vehicle_color, cap, bag, helmet, class_name
+    """
+    query_lower = query.lower()
+    extracted = {}
+    
+    # Extract colors
+    found_colors = [color for color in COLORS if color in query_lower]
+    if found_colors:
+        # Determine if color refers to clothing or vehicle based on context
+        if any(word in query_lower for word in ["shirt", "clothing", "jacket", "top", "upper", "t-shirt", "hoodie", "sweater"]):
+            extracted["upper_color"] = found_colors[0].capitalize()
+        elif any(word in query_lower for word in ["pants", "jeans", "trousers", "lower", "skirt"]):
+            extracted["lower_color"] = found_colors[0].capitalize()
+        elif any(word in query_lower for word in ["car", "vehicle", "truck", "bus", "motorcycle", "sedan", "suv", "van"]):
+            extracted["vehicle_color"] = found_colors[0].capitalize()
+        else:
+            # Default to upper color for people if context unclear
+            if "person" in query_lower or "man" in query_lower or "woman" in query_lower or "guy" in query_lower:
+                extracted["upper_color"] = found_colors[0].capitalize()
+    
+    # Extract vehicle type
+    for vtype in VEHICLE_TYPES:
+        if vtype in query_lower:
+            extracted["vehicle_type"] = vtype.capitalize()
+            extracted["class_name"] = "car" if vtype in ["hatchback", "sedan", "suv"] else vtype
+            break
+    
+    # Extract class name from query
+    if "person" in query_lower or "man" in query_lower or "woman" in query_lower or "guy" in query_lower or "people" in query_lower:
+        extracted["class_name"] = "person"
+    elif "car" in query_lower or "vehicle" in query_lower:
+        if "class_name" not in extracted:
+            extracted["class_name"] = "car"
+    
+    # Extract accessories
+    if "cap" in query_lower or "hat" in query_lower:
+        extracted["cap"] = "Yes"
+    if "bag" in query_lower or "backpack" in query_lower or "purse" in query_lower:
+        extracted["bag"] = "Yes"
+    if "helmet" in query_lower:
+        extracted["helmet"] = "Yes"
+    
+    # Negative filters (e.g., "without cap", "no bag")
+    if "without cap" in query_lower or "no cap" in query_lower or "not wearing cap" in query_lower:
+        extracted["cap"] = "No"
+    if "without bag" in query_lower or "no bag" in query_lower or "not carrying bag" in query_lower:
+        extracted["bag"] = "No"
+    if "without helmet" in query_lower or "no helmet" in query_lower or "not wearing helmet" in query_lower:
+        extracted["helmet"] = "No"
+    
+    return extracted
 
 class SearchRequest(BaseModel):
     query: str
@@ -124,8 +186,12 @@ def search_by_text(
         except Exception as e:
             print(f"[Search] Translation failed, falling back to original: {e}")
             query_english = request.query
-            
-    # 2. Get CLIP text embedding
+    
+    # 2. Parse natural language query to extract structured attributes
+    parsed_attributes = parse_query_attributes(query_english)
+    print(f"[Search] Parsed attributes from query: {parsed_attributes}")
+    
+    # 3. Get CLIP text embedding
     try:
         query_vector = search_engine.get_text_embedding(query_english)
     except Exception as e:
@@ -134,12 +200,12 @@ def search_by_text(
             detail=f"Error generating text embedding: {e}"
         )
         
-    # 3. FAISS Vector Search
+    # 4. FAISS Vector Search
     scores, ids = search_engine.search(query_vector, top_k=request.top_k)
     if not ids:
         return []
 
-    # 4. Retrieve from Database
+    # 5. Retrieve from Database
     # Maintain the order of FAISS search result scores
     detections = db.query(Detection).filter(Detection.id.in_(ids)).all()
     detections_map = {det.id: det for det in detections}
@@ -151,17 +217,20 @@ def search_by_text(
     
     results = []
     
-    # Attributes filter dictionary
+    # Merge parsed attributes with manual filters (manual filters take precedence)
     attr_filters = {
         "gender": None,  # Can add if UI requires
-        "vehicle_type": request.vehicle_type,
-        "vehicle_color": request.vehicle_color,
-        "upper_color": request.upper_color,
-        "lower_color": request.lower_color,
-        "cap": request.cap,
-        "bag": request.bag,
-        "helmet": request.helmet
+        "vehicle_type": request.vehicle_type if request.vehicle_type else parsed_attributes.get("vehicle_type"),
+        "vehicle_color": request.vehicle_color if request.vehicle_color else parsed_attributes.get("vehicle_color"),
+        "upper_color": request.upper_color if request.upper_color else parsed_attributes.get("upper_color"),
+        "lower_color": request.lower_color if request.lower_color else parsed_attributes.get("lower_color"),
+        "cap": request.cap if request.cap else parsed_attributes.get("cap"),
+        "bag": request.bag if request.bag else parsed_attributes.get("bag"),
+        "helmet": request.helmet if request.helmet else parsed_attributes.get("helmet")
     }
+    
+    # Merge class_name filter
+    effective_class_name = request.class_name if request.class_name else parsed_attributes.get("class_name")
 
     for score, det_id in zip(scores, ids):
         det = detections_map.get(det_id)
@@ -173,8 +242,8 @@ def search_by_text(
             if det.camera_id != request.camera_id:
                 continue
                 
-        if request.class_name and request.class_name != "all" and request.class_name != "All":
-            if det.class_name.lower() != request.class_name.lower():
+        if effective_class_name and effective_class_name != "all" and effective_class_name != "All":
+            if det.class_name.lower() != effective_class_name.lower():
                 continue
                 
         # Time-range filters

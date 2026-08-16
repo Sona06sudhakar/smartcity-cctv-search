@@ -3,14 +3,18 @@ import cv2
 import json
 import time
 import hashlib
+import numpy as np
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from PIL import Image
 
 from app.auth import get_db, get_current_user, User
-from app.database import Detection, Video, ChainOfCustody, AuditLog
-from app.config import VIDEOS_DIR, CROPS_DIR, REPORTS_DIR
+from app.database import Detection, Video, TrackPoint, ChainOfCustody, AuditLog
+from app.config import VIDEOS_DIR, CROPS_DIR, REPORTS_DIR, YOLO_MODEL_NAME
+from app.search_engine import get_search_engine
+from ultralytics import YOLO
 
 router = APIRouter(prefix="/api/exports", tags=["Forensic Exports"])
 
@@ -280,6 +284,102 @@ def stream_mjpeg(
         finally:
             cap.release()
             
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@router.get("/stream-target/{detection_id}")
+def stream_target(
+    detection_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    det = db.query(Detection).filter(Detection.id == detection_id).first()
+    if not det:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Detection not found"
+        )
+
+    video = db.query(Video).filter(Video.id == det.video_id).first()
+    if not video:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source video not found"
+        )
+
+    src_path = VIDEOS_DIR / video.filename
+    if not src_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Raw video file not found at {src_path}"
+        )
+
+    # Use the stored track points for the selected target within the same video
+    track_points = db.query(TrackPoint).filter(
+        TrackPoint.video_id == det.video_id,
+        TrackPoint.track_id == det.track_id,
+        TrackPoint.class_name == det.class_name
+    ).order_by(TrackPoint.frame_number.asc()).all()
+
+    if not track_points:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No track points found for this target"
+        )
+
+    boxes_by_frame = {p.frame_number: p for p in track_points}
+    first_frame = track_points[0].frame_number
+
+    cap = cv2.VideoCapture(str(src_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    start_frame = max(0, first_frame - int(fps * 2))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    def frame_generator():
+        frame_delay = 1.0 / fps
+        current_frame = start_frame
+        try:
+            while cap.isOpened():
+                success, frame = cap.read()
+                if not success:
+                    break
+
+                annotated_frame = frame.copy()
+                det_for_frame = boxes_by_frame.get(current_frame)
+                if det_for_frame is not None:
+                    x1, y1, x2, y2 = det_for_frame.x1, det_for_frame.y1, det_for_frame.x2, det_for_frame.y2
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                    label = f"Track {det.track_id}"
+                    cv2.putText(
+                        annotated_frame,
+                        label,
+                        (x1, max(20, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA
+                    )
+
+                height, width = annotated_frame.shape[:2]
+                if width > 640:
+                    scale = 640.0 / width
+                    annotated_frame = cv2.resize(annotated_frame, (640, int(height * scale)))
+
+                ret, jpeg = cv2.imencode('.jpg', annotated_frame)
+                if not ret:
+                    current_frame += 1
+                    continue
+
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+                current_frame += 1
+                time.sleep(frame_delay)
+        finally:
+            cap.release()
+
     return StreamingResponse(
         frame_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame"

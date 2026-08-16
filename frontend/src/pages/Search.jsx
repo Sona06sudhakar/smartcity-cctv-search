@@ -53,6 +53,7 @@ function SearchPage({ token }) {
   // Playback overlay state
   const [activePlayback, setActivePlayback] = useState(null);
   const [playbackPlaying, setPlaybackPlaying] = useState(true);
+  const [forceReloadKey, setForceReloadKey] = useState(0);
   
   // Timeline overlay state
   const [activeTimeline, setActiveTimeline] = useState(null); // Timeline dict
@@ -878,8 +879,8 @@ function SearchPage({ token }) {
               <div className="relative w-full h-[360px] bg-black border border-slate-800 rounded-xl overflow-hidden flex items-center justify-center">
                 {playbackPlaying ? (
                   <img 
-                    src={`/api/exports/stream-mjpeg/${activePlayback.video_id}?start_sec=${activePlayback.timestamp_sec}&t=${Date.now()}`}
-                    alt="MJPEG Video Stream"
+                    src={`/api/exports/stream-target/${activePlayback.id}?access_token=${encodeURIComponent(token)}&t=${Date.now()}&v=${forceReloadKey}`}
+                    alt="Target Tracking Stream"
                     className="max-h-full max-w-full object-contain"
                   />
                 ) : (
@@ -903,6 +904,19 @@ function SearchPage({ token }) {
                 >
                   Stream Play
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Force the stream handler to restart and use the stored first-appearance boxes
+                    setForceReloadKey(k => k + 1);
+                    setPlaybackPlaying(true);
+                  }}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-all"
+                >
+                  Follow From First Appearance
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setPlaybackPlaying(false)}

@@ -2,15 +2,142 @@ import json
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from PIL import Image
+from pydantic import BaseModel
 
 from app.auth import get_db, get_current_user, User
-from app.database import Detection, Video, AuditLog
+from app.database import Detection, Video, TrackPoint, AuditLog
 from app.search_engine import get_search_engine
 from app.config import CROPS_DIR
+from app.routes.search import parse_query_attributes
 
 router = APIRouter(prefix="/api/tracking", tags=["Cross-Camera Tracking"])
+
+class VideoSearchRequest(BaseModel):
+    query: str
+
+@router.get("/videos")
+def get_processed_videos(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get list of all processed videos with their metadata."""
+    videos = db.query(Video).filter(Video.status == "completed").order_by(Video.upload_time.desc()).all()
+    return [
+        {
+            "id": v.id,
+            "filename": v.filename,
+            "camera_id": v.camera_id,
+            "upload_time": v.upload_time.isoformat(),
+            "duration": v.duration,
+            "status": v.status
+        }
+        for v in videos
+    ]
+
+@router.get("/video/{video_id}/detections")
+def get_video_detections(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all detections for a specific video with YOLO box coordinates."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    detections = db.query(Detection).filter(Detection.video_id == video_id).order_by(Detection.timestamp_sec.asc()).all()
+    
+    return [
+        {
+            "id": d.id,
+            "timestamp": d.timestamp,
+            "timestamp_sec": d.timestamp_sec,
+            "frame_number": d.frame_number,
+            "track_id": d.track_id,
+            "class_name": d.class_name,
+            "confidence": float(d.confidence),
+            "bbox": {
+                "x1": d.x1,
+                "y1": d.y1,
+                "x2": d.x2,
+                "y2": d.y2
+            },
+            "attributes": json.loads(d.attributes_json)
+        }
+        for d in detections
+    ]
+
+@router.post("/video/{video_id}/search")
+def search_within_video(
+    video_id: int,
+    request: VideoSearchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Search within a specific video for attributes and return matching detections with timestamps."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    query = request.query
+    
+    # Parse query to extract structured attributes
+    parsed_attrs = parse_query_attributes(query)
+    
+    # Get all detections for this video
+    detections = db.query(Detection).filter(Detection.video_id == video_id).order_by(Detection.timestamp_sec.asc()).all()
+    
+    # Filter detections based on parsed attributes
+    filtered_detections = []
+    for det in detections:
+        try:
+            det_attrs = json.loads(det.attributes_json)
+        except:
+            det_attrs = {}
+        
+        # Check if detection matches parsed attributes
+        match = True
+        for key, val in parsed_attrs.items():
+            if val is None or val == "":
+                continue
+            
+            if key == "class_name":
+                if det.class_name.lower() != val.lower():
+                    match = False
+                    break
+            else:
+                det_val = det_attrs.get(key)
+                if not det_val or str(det_val).lower() != str(val).lower():
+                    match = False
+                    break
+        
+        if match:
+            filtered_detections.append({
+                "id": det.id,
+                "timestamp": det.timestamp,
+                "timestamp_sec": det.timestamp_sec,
+                "frame_number": det.frame_number,
+                "track_id": det.track_id,
+                "class_name": det.class_name,
+                "confidence": float(det.confidence),
+                "bbox": {
+                    "x1": det.x1,
+                    "y1": det.y1,
+                    "x2": det.x2,
+                    "y2": det.y2
+                },
+                "attributes": det_attrs
+            })
+    
+    return {
+        "video_id": video_id,
+        "query": query,
+        "parsed_attributes": parsed_attrs,
+        "matches": filtered_detections,
+        "total_matches": len(filtered_detections)
+    }
 
 @router.get("/timeline/{detection_id}")
 def get_cross_camera_timeline(
@@ -58,25 +185,25 @@ def get_cross_camera_timeline(
         )
 
     # 3. Fetch movement path of this exact track within the same video
-    track_movement_dets = db.query(Detection).filter(
-        Detection.video_id == target_det.video_id,
-        Detection.track_id == target_det.track_id
-    ).order_by(Detection.timestamp_sec.asc()).all()
+    track_movement_points = db.query(TrackPoint).filter(
+        TrackPoint.video_id == target_det.video_id,
+        TrackPoint.track_id == target_det.track_id
+    ).order_by(TrackPoint.frame_number.asc()).all()
     
     track_movement = [
         {
-            "detection_id": d.id,
-            "camera_id": d.camera_id,
-            "video_id": d.video_id,
-            "track_id": d.track_id,
-            "timestamp": d.timestamp,
-            "timestamp_sec": d.timestamp_sec,
-            "confidence": float(d.confidence),
-            "image_path": d.image_path,
-            "class_name": d.class_name,
-            "attributes": json.loads(d.attributes_json)
+            "detection_id": target_det.id,
+            "camera_id": target_det.camera_id,
+            "video_id": target_det.video_id,
+            "track_id": target_det.track_id,
+            "timestamp": p.timestamp,
+            "timestamp_sec": p.timestamp_sec,
+            "confidence": float(p.confidence),
+            "image_path": target_det.image_path,
+            "class_name": p.class_name,
+            "attributes": json.loads(target_det.attributes_json)
         }
-        for d in track_movement_dets
+        for p in track_movement_points
     ]
 
     # 4. Search FAISS index for visually similar objects (Cross-Camera matching)

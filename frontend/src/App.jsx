@@ -7,9 +7,7 @@ import {
   FileText, 
   GitBranch, 
   LogOut, 
-  LayoutDashboard, 
-  CheckCircle,
-  Database
+  LayoutDashboard
 } from 'lucide-react';
 
 import Login from './pages/Login';

@@ -11,6 +11,7 @@ reportlab
 deep-translator
 python-dotenv
 cryptography
+python-jose[cryptography]
 pydantic>=2.0
 pyjwt
 passlib[bcrypt]

@@ -1,14 +1,19 @@
 import os
 import shutil
 import time
+import cv2
 from fastapi import APIRouter, Depends, UploadFile, File, Form, BackgroundTasks, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
+from ultralytics import YOLO
 
 from app.auth import get_db, get_current_user, User
 from app.database import Video, Detection, AuditLog
-from app.config import VIDEOS_DIR, CROPS_DIR
+from app.config import VIDEOS_DIR, CROPS_DIR, YOLO_MODEL_PATH
 from app.pipeline import video_pipeline
+
+MODEL = YOLO(str(YOLO_MODEL_PATH))
+TARGET_CLASSES = {"person", "car", "bus", "truck", "motorcycle", "bicycle"}
 
 router = APIRouter(prefix="/api/videos", tags=["Video Upload & Ingestion"])
 
@@ -176,6 +181,93 @@ def delete_video(video_id: int, db: Session = Depends(get_db), current_user: Use
     db.commit()
     
     return {"message": f"Video {video_id} and all related detections successfully deleted."}
+
+@router.post("/process")
+async def process_video_for_detection(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".mp4", ".avi", ".mov", ".mkv"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported video format. Use .mp4, .avi, .mov, or .mkv"
+        )
+
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
+    timestamp = int(time.time())
+    src_name = f"{timestamp}_{file.filename}"
+    source_path = os.path.join(VIDEOS_DIR, src_name)
+
+    with open(source_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    cap = cv2.VideoCapture(source_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Could not read uploaded video file")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+
+    base_name = os.path.splitext(src_name)[0]
+    output_name = f"{base_name}_detected.mp4"
+    output_path = os.path.join(VIDEOS_DIR, output_name)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        cap.release()
+        raise HTTPException(status_code=500, detail="Could not create output MP4 writer")
+
+    frame_count = 0
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+
+            frame_count += 1
+            results = MODEL(frame, verbose=False, conf=0.25, iou=0.45)
+            detections = results[0].boxes
+
+            if detections is not None:
+                boxes = detections.xyxy.cpu().numpy()
+                classes = detections.cls.cpu().numpy()
+                scores = detections.conf.cpu().numpy()
+
+                for box, cls_id, score in zip(boxes, classes, scores):
+                    class_name = MODEL.names[int(cls_id)]
+                    if class_name not in TARGET_CLASSES:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"{class_name} {score * 100:.0f}%"
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, max(20, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+            out.write(frame)
+    finally:
+        cap.release()
+        out.release()
+
+    return {
+        "message": "Video processed successfully.",
+        "input_file": file.filename,
+        "output_file": output_name,
+        "video_url": f"/static/videos/{output_name}",
+        "frame_count": frame_count,
+    }
 
 @router.post("/scan-local")
 def scan_local_videos(

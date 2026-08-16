@@ -52,6 +52,27 @@ class Detection(Base):
     faiss_id = Column(Integer, index=True, unique=True, nullable=False)
 
     video = relationship("Video", back_populates="detections")
+    track_points = relationship("TrackPoint", back_populates="detection", cascade="all, delete-orphan")
+
+class TrackPoint(Base):
+    __tablename__ = "track_points"
+
+    id = Column(Integer, primary_key=True, index=True)
+    detection_id = Column(Integer, ForeignKey("detections.id"), nullable=False)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False)
+    track_id = Column(Integer, index=True, nullable=False)
+    timestamp = Column(String, nullable=False)
+    timestamp_sec = Column(Float, nullable=False)
+    frame_number = Column(Integer, nullable=False)
+    x1 = Column(Integer, nullable=False)
+    y1 = Column(Integer, nullable=False)
+    x2 = Column(Integer, nullable=False)
+    y2 = Column(Integer, nullable=False)
+    class_name = Column(String, index=True, nullable=False)
+    confidence = Column(Float, nullable=False)
+
+    detection = relationship("Detection", back_populates="track_points")
+    video = relationship("Video")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
